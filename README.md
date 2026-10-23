@@ -39,6 +39,8 @@ Your browser opens <http://localhost:8765>. Stop it with Ctrl+C. (On Windows, us
 | `Q8119\|P31\|en:"Key:x"\|P50\|"Key:y"` | Add a qualifier to the statement |
 | `-Q99\|P8\|"https://…"` | Remove a statement |
 | `Q99\|Lmul\|"brand:wikidata"` | Set a label (`Den` description, `Aen` alias) |
+| `CREATE` then `LAST\|P2\|Q7` | Create a new item, then edit it with `LAST` |
+| `CREATE\|@nacs` … `LAST\|P22\|@nacs` | Name a new item so later lines can use it as `@nacs` |
 
 - Fields are separated by `|` or tabs; lines by new lines or `||`.
 - `somevalue` and `novalue` work as values.
@@ -46,7 +48,11 @@ Your browser opens <http://localhost:8765>. Stop it with Ctrl+C. (On Windows, us
 - Add `/* summary */` at the end of a line for a per-line edit summary.
 - Key and tag items keep their label in `mul` (multilingual); the preview warns if `Len`
   would just duplicate it.
-- Not supported yet: creating new items (`CREATE`/`LAST`), dates, quantities and coordinates.
+- `LAST` is the most recent `CREATE`; it works as an item or a value. `@name` is an
+  extension for when a later item has to point back to an earlier new one.
+- A `CREATE` is refused if an item with the same label already exists, so running a batch
+  twice can't make duplicates.
+- Not supported yet: dates, quantities and coordinates.
 
 ## Why it is safe
 

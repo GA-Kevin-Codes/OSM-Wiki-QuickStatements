@@ -78,6 +78,10 @@ class FakeWiki(osmqs.Wiki):
             if params["lgpassword"] != "right":
                 return {"login": {"result": "Failed", "reason": "Incorrect password"}}
             return {"login": {"result": "Success", "lgusername": "Tester"}}
+        if a == "wbsearchentities":
+            hits = [{"id": eid, "label": osmqs.label_of(e)} for eid, e in self.entities.items()
+                    if e.get("type") == "item" and params["search"].lower() in osmqs.label_of(e).lower()]
+            return {"search": hits}
         if a == "wbgetentities":
             ents = {}
             for eid in params["ids"].split("|"):
@@ -147,6 +151,11 @@ class FakeWiki(osmqs.Wiki):
             ent["aliases"].setdefault(p["language"], []).append({"language": p["language"], "value": p["add"]})
             ent["lastrevid"] += 1
             return {"success": 1, "entity": {"lastrevid": ent["lastrevid"]}}
+        if a == "wbeditentity" and p.get("new") == "item":
+            eid = f"Q{1000 + sum(1 for e in self.entities.values() if e.get('type') == 'item')}"
+            self.entities[eid] = {"id": eid, "type": "item", "lastrevid": 500,
+                                  "labels": {}, "descriptions": {}, "aliases": {}, "claims": {}}
+            return {"success": 1, "entity": {"id": eid, "lastrevid": 500}}
         raise osmqs.WikiError("unknown-action", a)
 
 
@@ -193,9 +202,26 @@ class ParseTest(unittest.TestCase):
         self.assertTrue(all(c.error for c in cmds))
 
     def test_errors_are_reported_per_line(self):
-        cmds = osmqs.parse('CREATE\nQ1|P8\nX1|P8|"a"\nQ1|P8|"a"|P50\nQ1|P8|bare')
+        cmds = osmqs.parse('CREATE|x\nQ1|P8\nX1|P8|"a"\nQ1|P8|"a"|P50\nQ1|P8|bare')
         self.assertTrue(all(c.error for c in cmds))
-        self.assertIn("creating new items", cmds[0].error)
+        self.assertIn("CREATE takes nothing else", cmds[0].error)
+
+    def test_create_last_and_names(self):
+        cmds = osmqs.parse("\n".join([
+            "CREATE|@parent", 'LAST|Lmul|"socket:x"',
+            "CREATE", "LAST|P22|@parent", "@parent|P46|LAST",
+        ]))
+        self.assertEqual([c.error for c in cmds], [""] * 5)
+        self.assertEqual([c.item for c in cmds], ["NEW1", "NEW1", "NEW2", "NEW2", "NEW1"])
+        self.assertEqual([cmds[3].value, cmds[4].value], [("entity", "NEW1"), ("entity", "NEW2")])
+
+    def test_bad_references_to_new_items(self):
+        cmds = osmqs.parse('LAST|P8|"a"\nQ1|P6|@nope\nCREATE|@a\nCREATE|@a\nCREATE|nope')
+        self.assertIn("before any CREATE", cmds[0].error)
+        self.assertIn("not named", cmds[1].error)
+        self.assertIn("already the name", cmds[3].error)
+        self.assertEqual([c.item for c in cmds[2:]], ["NEW1", "NEW2", "NEW3"])
+        self.assertTrue(cmds[4].error)
 
 
 class PlanTest(unittest.TestCase):
@@ -325,6 +351,72 @@ class RunAndVerifyTest(unittest.TestCase):
         with self.assertRaises(osmqs.WikiError) as ctx:
             wiki.login("Tester@bot", "wrong")
         self.assertEqual(ctx.exception.info, "Incorrect password")
+
+
+class CreateTest(unittest.TestCase):
+    BATCH = "\n".join([
+        "CREATE|@parent",
+        'LAST|Lmul|"socket:x"',
+        "LAST|P6|Q13",
+        "CREATE",
+        'LAST|Lmul|"socket:x:output"',
+        "LAST|P20|P6",
+        "LAST|P6|Q13|P6|@parent|S6|@parent",
+        "@parent|P6|LAST",
+        "Q99|P6|@parent",
+    ])
+
+    def test_plan_uses_stand_in_ids(self):
+        wiki = FakeWiki()
+        plan = plan_for(wiki, self.BATCH)
+        self.assertEqual([s.status for s in plan.steps], ["ready"] * 9)
+        self.assertEqual(plan.steps[0].action, 'Create a new item "socket:x"')
+        self.assertEqual(plan.steps[0].params["data"], "{}")
+        self.assertEqual(plan.steps[8].needs, ("NEW1",))
+        self.assertEqual(plan.steps[6].needs, ("NEW1", "NEW2"))
+        self.assertEqual(plan.labels["NEW2"], "socket:x:output")
+
+    def test_run_creates_items_and_fills_in_their_ids(self):
+        wiki = FakeWiki()
+        wiki.login("Tester@bot", "right")
+        job = run(wiki, plan_for(wiki, self.BATCH))
+        self.assertEqual([s.status for s in job.plan.steps], ["done"] * 9)
+        parent, child = job.plan.created["NEW1"], job.plan.created["NEW2"]
+        self.assertEqual(wiki.entities[parent]["labels"]["mul"]["value"], "socket:x")
+        child_claim = wiki.entities[child]["claims"]["P6"][0]
+        self.assertTrue(child_claim["id"].startswith(child + "$"))
+        self.assertEqual(child_claim["qualifiers"]["P6"][0]["datavalue"]["value"]["id"], parent)
+        self.assertEqual(child_claim["references"][0]["snaks"]["P6"][0]["datavalue"]["value"],
+                         {"entity-type": "item", "numeric-id": int(parent[1:]), "id": parent})
+        self.assertEqual([c["mainsnak"]["datavalue"]["value"]["id"]
+                          for c in wiki.entities[parent]["claims"]["P6"]], ["Q13", child])
+        self.assertEqual(wiki.entities["Q99"]["claims"]["P6"][-1]["mainsnak"]["datavalue"]["value"]["id"], parent)
+        self.assertEqual(sorted(v["item"] for v in job.verification), sorted([parent, child, "Q99"]))
+        self.assertTrue(all(v["ok"] for v in job.verification), job.verification)
+        self.assertEqual(job.plan.steps[1].item, "NEW1")
+        self.assertEqual(osmqs.App(wiki).steps_json(job.plan)[1]["item"], parent)
+
+    def test_existing_label_blocks_the_create(self):
+        wiki = FakeWiki()
+        plan = plan_for(wiki, 'CREATE\nLAST|Lmul|"brand:wikidata"\nLAST|P6|Q13\nQ99|P6|LAST')
+        self.assertEqual([s.status for s in plan.steps], ["error"] * 4)
+        self.assertIn("already exists: Q99", plan.steps[0].message)
+        self.assertIn("CREATE line has an error", plan.steps[1].message)
+        self.assertIn("CREATE line has an error", plan.steps[3].message)
+
+    def test_failed_create_fails_its_lines(self):
+        wiki = FakeWiki()
+        wiki.login("Tester@bot", "right")
+        original_edit = wiki._edit
+
+        def no_create(p):
+            if p.get("new"):
+                raise osmqs.WikiError("permissiondenied", "no")
+            return original_edit(p)
+        wiki._edit = no_create
+        job = run(wiki, plan_for(wiki, 'CREATE\nLAST|P6|Q13\nQ99|P8|"a"'), stop_on_error=False)
+        self.assertEqual([s.status for s in job.plan.steps], ["failed", "failed", "done"])
+        self.assertIn("was not created", job.plan.steps[1].message)
 
 
 class ServerTest(unittest.TestCase):

@@ -48,6 +48,8 @@ MAX_STRING = {"url": 500}
 MAX_STRING_DEFAULT = 400
 MAX_TERM = 250
 DEFAULT_SUMMARY = "OSM Wiki QuickStatements batch"
+NEW_NAME = re.compile(r"@[A-Za-z0-9_:.-]+")   # CREATE|@name, then @name as item or value
+NEW_ID = re.compile(r"NEW[1-9]\d*")           # stand-in ID of an item not created yet
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +158,12 @@ class Wiki:
                 out[eid] = None if "missing" in ent else ent
         return out
 
+    def items_labelled(self, text):
+        """IDs of items whose label (in English, or the mul fallback) is exactly `text`."""
+        res = self.request({"action": "wbsearchentities", "search": text, "language": "en",
+                            "type": "item", "limit": "50"})
+        return [r["id"] for r in res.get("search", []) if r.get("label") == text]
+
     def get_entities_one_by_one(self, ids, props):
         out = {}
         for eid in ids:
@@ -198,8 +206,9 @@ class Wiki:
 class Command:
     line_no: int
     raw: str
-    item: str = ""
-    kind: str = ""          # statement | remove | label | description | alias
+    item: str = ""          # Q123, or NEW1, NEW2, ... for items created in this batch
+    kind: str = ""          # create | statement | remove | label | description | alias
+    name: str = ""          # CREATE|@name: lets later lines refer to the new item as @name
     prop: str = ""
     value: tuple = ()
     lang: str = ""
@@ -243,6 +252,8 @@ def parse_value(token):
     t = token.strip()
     if re.fullmatch(r"[QqPp][1-9]\d*", t):
         return ("entity", t.upper())
+    if t.upper() == "LAST" or NEW_NAME.fullmatch(t):
+        return ("entity", t.upper())   # an item created in this batch; see parse()
     if t in ("somevalue", "novalue"):
         return (t,)
     m = re.fullmatch(r'([a-z][a-z0-9-]*):"(.*)"', t, re.S)
@@ -265,12 +276,17 @@ def parse_line(line_no, raw):
     try:
         remove = fields[0].startswith("-")
         cmd.item = fields[0].lstrip("-").strip().upper()
-        if cmd.item in ("CREATE", "LAST"):
-            raise ValueError("creating new items is not supported")
+        if cmd.item == "CREATE":
+            cmd.kind = "create"
+            cmd.item = ""
+            if remove or len(fields) > 2 or (len(fields) == 2 and not NEW_NAME.fullmatch(fields[1])):
+                raise ValueError("CREATE takes nothing else, or a name like CREATE|@nacs")
+            cmd.name = fields[1].upper() if len(fields) == 2 else ""
+            return cmd
         if len(fields) < 3:
             raise ValueError("expected at least: item | property | value")
-        if not re.fullmatch(r"Q[1-9]\d*", cmd.item):
-            raise ValueError(f"{fields[0]!r} is not an item ID like Q123")
+        if not (re.fullmatch(r"Q[1-9]\d*", cmd.item) or cmd.item == "LAST" or NEW_NAME.fullmatch(cmd.item)):
+            raise ValueError(f"{fields[0]!r} is not an item ID like Q123 (or LAST, @name)")
         term = re.fullmatch(r"([LDA])([a-z][a-z0-9-]*)", fields[1])
         if term:
             if remove:
@@ -302,16 +318,58 @@ def parse_line(line_no, raw):
                 raise ValueError(f"{key!r} is not a qualifier (P…) or source (S…)")
     except ValueError as exc:
         cmd.error = str(exc)
-        if not re.fullmatch(r"Q[1-9]\d*", cmd.item):
+        if not (re.fullmatch(r"Q[1-9]\d*", cmd.item) or cmd.item == "LAST" or NEW_NAME.fullmatch(cmd.item)):
             cmd.item = ""
     return cmd
 
 
 def parse(text):
+    """Parse a batch. Each CREATE gets a stand-in ID (NEW1, NEW2, ...); LAST and
+    @name are replaced by it here, and by the real ID once the item exists."""
     commands = []
+    new_count, names, last = 0, {}, None
+
+    def ref(x):
+        if x == "LAST":
+            if not last:
+                raise ValueError("LAST is used before any CREATE line")
+            return last
+        if x.startswith("@"):
+            if x not in names:
+                raise ValueError(f"{x} is not named by an earlier CREATE|{x} line")
+            return names[x]
+        return x
+
+    def ref_value(v):
+        return ("entity", ref(v[1])) if v[0] == "entity" else v
+
     for n, raw in enumerate(split_lines(text), start=1):
-        if raw.strip():
-            commands.append(parse_line(n, raw))
+        if not raw.strip():
+            continue
+        cmd = parse_line(n, raw)
+        commands.append(cmd)
+        if cmd.kind == "create":
+            # Even a CREATE line with an error gets an ID, so the lines after it
+            # fail with it instead of landing on the previous new item.
+            new_count += 1
+            cmd.item = last = f"NEW{new_count}"
+            if cmd.name and not cmd.error:
+                if cmd.name in names:
+                    cmd.error = f"{cmd.name} is already the name of an earlier CREATE"
+                else:
+                    names[cmd.name] = cmd.item
+            continue
+        try:
+            cmd.item = ref(cmd.item) if cmd.item else ""
+            if cmd.error:
+                continue
+            cmd.value = ref_value(cmd.value)
+            cmd.qualifiers = [(p, ref_value(v)) for p, v in cmd.qualifiers]
+            cmd.sources = [(p, ref_value(v)) for p, v in cmd.sources]
+        except ValueError as exc:
+            cmd.error = cmd.error or str(exc)
+            if not NEW_ID.fullmatch(cmd.item) and not re.fullmatch(r"Q[1-9]\d*", cmd.item):
+                cmd.item = ""
     return commands
 
 
@@ -331,10 +389,13 @@ def make_snak(prop, value, datatype):
         return {"snaktype": value[0], "property": prop}
     if datatype in ENTITY_DATATYPES:
         kind, prefix = ENTITY_DATATYPES[datatype]
-        if value[0] != "entity" or value[1][0] != prefix:
+        new = value[0] == "entity" and NEW_ID.fullmatch(value[1])
+        if value[0] != "entity" or (value[1][0] != prefix and not (new and kind == "item")):
             raise ValueError(f"{prop} needs a{'n' if kind == 'item' else ''} {kind} ID like {prefix}123")
+        # A new item's numeric ID is only known once it exists; see swap_new_ids().
         dv = {"type": "wikibase-entityid",
-              "value": {"entity-type": kind, "numeric-id": int(value[1][1:]), "id": value[1]}}
+              "value": {"entity-type": kind, "id": value[1]} if new else
+              {"entity-type": kind, "numeric-id": int(value[1][1:]), "id": value[1]}}
     elif datatype in STRING_DATATYPES:
         if value[0] != "string":
             raise ValueError(f'{prop} needs "quoted text"')
@@ -389,6 +450,7 @@ class Step:
     expect: dict = field(default_factory=dict)  # what verification should find
     message: str = ""
     revid: int = 0
+    needs: tuple = ()        # stand-in IDs (NEW1, ...) that must be created first
 
 
 @dataclass
@@ -396,6 +458,7 @@ class Plan:
     steps: list
     before: dict             # item -> entity as fetched (untouched copy)
     labels: dict             # entity id -> display label
+    created: dict = field(default_factory=dict)   # NEW1 -> Q123, filled in while running
 
 
 def label_of(entity):
@@ -407,7 +470,7 @@ def label_of(entity):
 
 
 def make_plan(wiki, commands, summary=""):
-    items = {c.item for c in commands if not c.error}
+    items = {c.item for c in commands if not c.error and not NEW_ID.fullmatch(c.item)}
     props = set()
     for c in commands:
         if not c.error and c.prop:
@@ -415,9 +478,27 @@ def make_plan(wiki, commands, summary=""):
             props.update(p for p, _ in c.qualifiers + c.sources)
     entities = wiki.get_entities(items) if items else {}
     prop_entities = wiki.get_entities(props, props="labels|datatype") if props else {}
+    labels = {eid: label_of(e) for eid, e in {**entities, **prop_entities}.items()}
+
+    # New items start empty. Refuse to create one whose label is already taken,
+    # so running the same batch twice can't make duplicates.
+    new_labels = {}
+    for c in commands:
+        if c.kind == "label" and not c.error and NEW_ID.fullmatch(c.item):
+            new_labels.setdefault(c.item, c.value[1])
+    for c in commands:
+        if c.kind != "create" or c.error:
+            continue
+        label = new_labels.get(c.item, "")
+        taken = wiki.items_labelled(label) if label else []
+        if taken:
+            c.error = f'an item labelled "{label}" already exists: {", ".join(taken)}'
+            continue
+        labels[c.item] = label
+        entities[c.item] = {"id": c.item, "type": "item", "labels": {}, "descriptions": {},
+                            "aliases": {}, "claims": {}}
     before = copy.deepcopy(entities)
     work = copy.deepcopy(entities)   # updated as steps are planned
-    labels = {eid: label_of(e) for eid, e in {**entities, **prop_entities}.items()}
 
     def datatype(prop):
         ent = prop_entities.get(prop)
@@ -429,10 +510,15 @@ def make_plan(wiki, commands, summary=""):
         if code not in wiki.languages(context):
             raise ValueError(f"{code!r} is not a language code the wiki accepts")
 
+    def values_of(c):
+        return [c.value] + [v for _, v in c.qualifiers + c.sources]
+
     def check_values(c):
-        for v in [c.value] + [v for _, v in c.qualifiers + c.sources]:
+        for v in values_of(c):
             if v and v[0] == "monolingual":
                 check_language(v[1], "monolingualtext")
+            if v and v[0] == "entity" and NEW_ID.fullmatch(v[1]) and v[1] not in work:
+                raise ValueError("it refers to a new item whose CREATE line has an error")
 
     steps = []
     for c in commands:
@@ -441,14 +527,25 @@ def make_plan(wiki, commands, summary=""):
             params = kw.pop("params", {})
             if params:
                 params["summary"] = line_summary
-            steps.append(Step(c.line_no, c.raw, c.item, action, status, params=params, **kw))
+            ids = [] if c.kind == "create" else \
+                [c.item] + [v[1] for v in values_of(c) if v and v[0] == "entity"]
+            needs = tuple(sorted({x for x in ids if NEW_ID.fullmatch(x)}))
+            steps.append(Step(c.line_no, c.raw, c.item, action, status, params=params, needs=needs, **kw))
 
         if c.error:
-            step("Can't read this line", "error", message=c.error)
+            step("Can't create this item" if c.kind == "create" else "Can't read this line",
+                 "error", message=c.error)
+            continue
+        if c.kind == "create":
+            label = labels.get(c.item)
+            step(f'Create a new item "{label}"' if label else "Create a new item",
+                 message="" if label else "no label is set for it in this batch",
+                 params={"action": "wbeditentity", "new": "item", "data": "{}"})
             continue
         ent = work.get(c.item)
         if ent is None:
-            step("Item not found", "error", message=f"{c.item} does not exist on the wiki")
+            step("Item not found", "error", message="its CREATE line has an error"
+                 if NEW_ID.fullmatch(c.item) else f"{c.item} does not exist on the wiki")
             continue
         try:
             if c.kind in ("label", "description", "alias"):
@@ -546,7 +643,7 @@ def make_plan(wiki, commands, summary=""):
                     step(f"Add source to {what}",
                          params={"action": "wbsetreference", "statement": target["id"],
                                  "snaks": json.dumps(snaks), "snaks-order": json.dumps(order)},
-                         expect={"reference": [target["id"], want]})
+                         expect={"reference": [target["id"], refs]})
                     target.setdefault("references", []).append({"snaks": snaks})
                     changed = True
             if not changed:
@@ -568,6 +665,38 @@ class Job:
     verification: list = field(default_factory=list)
 
 
+# Places a stand-in ID (NEW1) can appear as an item ID or a statement GUID ("NEW1$...").
+GUID_KEYS = {"id", "claim", "statement", "removed", "qualifier", "reference"}
+# Edit parameters that hold JSON which may contain entity values.
+JSON_PARAMS = {"wbsetclaim": "claim", "wbsetqualifier": "value", "wbsetreference": "snaks"}
+
+
+def _swap(x, created, key=None):
+    """Replace stand-in IDs of created items with their real IDs, in entity
+    values and in item IDs or statement GUIDs, recursively."""
+    if isinstance(x, dict):
+        if x.get("entity-type") == "item" and x.get("id") in created:
+            real = created[x["id"]]
+            return {**x, "numeric-id": int(real[1:]), "id": real}
+        return {k: _swap(v, created, k) for k, v in x.items()}
+    if isinstance(x, list):
+        return [_swap(v, created, key) for v in x]
+    if isinstance(x, str) and key in GUID_KEYS:
+        parts = (g.partition("$") for g in x.split("|"))
+        return "|".join(created.get(head, head) + sep + rest for head, sep, rest in parts)
+    return x
+
+
+def swap_new_ids(params, created):
+    out = {}
+    for k, v in params.items():
+        if JSON_PARAMS.get(params.get("action")) == k and v.startswith(("{", "[")):
+            out[k] = json.dumps(_swap(json.loads(v), created))
+        else:
+            out[k] = _swap(v, created, k)
+    return out
+
+
 def run_plan(wiki, job, bot=False, stop_on_error=True, delay=0.5):
     plan = job.plan
     revs = {eid: (ent or {}).get("lastrevid") for eid, ent in plan.before.items()}
@@ -578,7 +707,13 @@ def run_plan(wiki, job, bot=False, stop_on_error=True, delay=0.5):
             if job.cancelled:
                 step.status, step.message = "skip", "cancelled before it ran"
                 continue
-            params = dict(step.params)
+            missing = [n for n in step.needs if n not in plan.created]
+            if missing:
+                step.status, step.message = "failed", "the new item it needs was not created"
+                if stop_on_error:
+                    job.cancelled = True
+                continue
+            params = swap_new_ids(step.params, plan.created)
             if bot:
                 params["bot"] = "1"
             if revs.get(step.item):
@@ -590,6 +725,8 @@ def run_plan(wiki, job, bot=False, stop_on_error=True, delay=0.5):
                 if stop_on_error:
                     job.cancelled = True
                 continue
+            if params.get("new"):
+                plan.created[step.item] = res["entity"]["id"]
             rev = (res.get("pageinfo") or {}).get("lastrevid") or \
                 (res.get("entity") or {}).get("lastrevid")
             if rev:
@@ -613,14 +750,18 @@ def _strip_hashes(x):
 def verify(wiki, plan):
     """Re-read every edited item: planned changes must be there, nothing else may differ."""
     done = [s for s in plan.steps if s.status == "done"]
+    for s in done:
+        s.expect = _swap(s.expect, plan.created)
     items = sorted({s.item for s in done})
-    after = wiki.get_entities(items) if items else {}
+    real = {item: plan.created.get(item, item) for item in items}
+    after = wiki.get_entities(real.values()) if items else {}
     report = []
     for item in items:
-        before, now = plan.before[item], after.get(item)
+        # A new item's "before" is the empty item the batch started from.
+        before, now = plan.before[item], after.get(real[item])
         problems = []
         if now is None:
-            report.append({"item": item, "ok": False, "problems": ["item could not be re-read"]})
+            report.append({"item": real[item], "ok": False, "problems": ["item could not be re-read"]})
             continue
         now_claims = {c["id"]: c for cs in (now.get("claims") or {}).values() for c in cs}
         before_claims = {c["id"]: c for cs in (before.get("claims") or {}).values() for c in cs}
@@ -659,7 +800,8 @@ def verify(wiki, plan):
                 if not any(snak_key(x) == snak_key(q) for x in quals):
                     problems.append(f"line {s.line_no}: qualifier {q['property']} not found")
             elif "reference" in e:
-                cid, want = e["reference"]
+                cid, snaks = e["reference"]
+                want = sorted(snak_key(x) for x in snaks)
                 touched_ids.add(cid)
                 refs = [sorted(snak_key(x) for xs in r.get("snaks", {}).values() for x in xs)
                         for r in (now_claims.get(cid) or {}).get("references", [])]
@@ -691,7 +833,7 @@ def verify(wiki, plan):
                 if (section, lang) not in touched_terms and \
                         _strip_hashes(b.get(lang)) != _strip_hashes(n.get(lang)):
                     problems.append(f"{section[:-1]} ({lang}) changed unexpectedly")
-        report.append({"item": item, "ok": not problems, "problems": problems})
+        report.append({"item": real[item], "ok": not problems, "problems": problems})
     return report
 
 
@@ -709,7 +851,8 @@ class App:
 
     def steps_json(self, plan):
         return [
-            {"line": s.line_no, "raw": s.raw, "item": s.item, "label": plan.labels.get(s.item, ""),
+            {"line": s.line_no, "raw": s.raw, "item": plan.created.get(s.item, s.item),
+             "label": plan.labels.get(s.item, ""),
              "action": s.action, "status": s.status, "message": s.message, "revid": s.revid}
             for s in plan.steps
         ]
@@ -892,7 +1035,7 @@ ul.verify { margin:0; padding-left:20px; }
 
   <section class="card">
     <h2>Commands</h2>
-    <label for="commands">One per line, QuickStatements style: <code>Q99|P13|"value"</code>, <code>-Q99|P8|"url"</code>, <code>Q99|Den|"description"</code>, qualifiers <code>|P50|"x"</code>, sources <code>|S11|"url"</code></label>
+    <label for="commands">One per line, QuickStatements style: <code>Q99|P13|"value"</code>, <code>-Q99|P8|"url"</code>, <code>Q99|Den|"description"</code>, new items <code>CREATE</code> then <code>LAST|P2|Q7</code>, qualifiers <code>|P50|"x"</code>, sources <code>|S11|"url"</code></label>
     <textarea id="commands" spellcheck="false" placeholder='Q99|P13|"Q[1-9]\d*(;Q[1-9]\d*)*"'></textarea>
     <div class="row" style="margin-top:12px">
       <div><label for="summary">Edit summary (optional)</label><input type="text" id="summary" placeholder="OSM Wiki QuickStatements batch"></div>
@@ -962,7 +1105,9 @@ function render(state) {
   $("cancel-btn").classList.toggle("hidden", !state.running);
 
   $("steps").innerHTML = steps.map((s) => {
-    const item = s.item ? `<a href="${WIKI}/wiki/Item:${esc(s.item)}" target="_blank">${esc(s.item)}</a>${s.label ? `<div class="msg">${esc(s.label)}</div>` : ""}` : "";
+    // NEW1, NEW2, ... are items this batch will create; they have no page yet.
+    const id = /^Q\d+$/.test(s.item) ? `<a href="${WIKI}/wiki/Item:${esc(s.item)}" target="_blank">${esc(s.item)}</a>` : esc(s.item);
+    const item = s.item ? `${id}${s.label ? `<div class="msg">${esc(s.label)}</div>` : ""}` : "";
     const rev = s.revid ? ` <a class="msg" href="${WIKI}/w/index.php?diff=${s.revid}" target="_blank">diff</a>` : "";
     return `<tr><td class="num">${s.line}</td><td>${item}</td>
       <td>${esc(s.action)}${s.message ? `<div class="msg">${esc(s.message)}</div>` : ""}<div><code class="msg">${esc(s.raw)}</code></div></td>
